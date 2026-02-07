@@ -8,10 +8,21 @@ use Adion\NexusCli\Command\ApiCommand;
 use Adion\NexusCli\Command\AuthCommand;
 use Adion\NexusCli\Command\InitCommand;
 
-$autoload = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
-if (file_exists($autoload)) {
-    require $autoload;
-} else {
+$autoloadCandidates = [
+    __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php',
+    __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'autoload.php',
+];
+
+$autoloadLoaded = false;
+foreach ($autoloadCandidates as $autoload) {
+    if (file_exists($autoload)) {
+        require $autoload;
+        $autoloadLoaded = true;
+        break;
+    }
+}
+
+if (!$autoloadLoaded) {
     spl_autoload_register(function ($class) {
         $prefix = 'Adion\\NexusCli\\';
         $baseDir = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR;
