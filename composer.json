@@ -1,0 +1,19 @@
+{
+  "name": "adion/nexus-cli",
+  "description": "Nexus CLI for API registry management",
+  "type": "library",
+  "license": "proprietary",
+  "bin": [
+    "bin/nexus"
+  ],
+  "require": {
+    "php": "^8.0",
+    "symfony/console": "^6.0",
+    "ext-curl": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Adion\\NexusCli\\": "src/"
+    }
+  }
+}
