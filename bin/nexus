@@ -38,7 +38,7 @@ if (!$autoloadLoaded) {
     });
 }
 
-$cli = new Application('Nexus CLI', '0.2.0');
+$cli = new Application('Nexus CLI', '0.2.2');
 $cli->add(new InitCommand());
 $cli->add(new AuthCommand());
 $cli->add(new ApiCommand());
