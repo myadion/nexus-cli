@@ -35,43 +35,31 @@ class ApiClient
     public function request(string $method, string $path, $body = null): array
     {
         $url = $this->baseUrl . $path;
-        $ch = curl_init($url);
-
         $method = strtoupper($method);
-        $options = [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CUSTOMREQUEST => $method,
-            CURLOPT_HTTPHEADER => $this->headers,
-            CURLOPT_HEADER => true,
-        ];
 
+        $content = null;
         if ($body !== null) {
-            if (is_array($body)) {
-                $body = json_encode($body, JSON_UNESCAPED_SLASHES);
-            }
-            $options[CURLOPT_POSTFIELDS] = $body;
+            $content = is_array($body) ? json_encode($body, JSON_UNESCAPED_SLASHES) : (string) $body;
         }
 
-        curl_setopt_array($ch, $options);
-        $response = curl_exec($ch);
+        $context = stream_context_create([
+            'http' => [
+                'method' => $method,
+                'header' => implode("\r\n", $this->headers),
+                'content' => $content,
+                'ignore_errors' => true,
+            ],
+        ]);
 
-        if ($response === false) {
-            $error = curl_error($ch);
-            curl_close($ch);
-            return [
-                'status' => 0,
-                'headers' => [],
-                'raw' => '',
-                'data' => null,
-                'error' => $error,
-            ];
+        $rawBody = @file_get_contents($url, false, $context);
+        $error = null;
+        if ($rawBody === false) {
+            $error = error_get_last()['message'] ?? 'HTTP request failed';
+            $rawBody = '';
         }
 
-        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $rawHeaders = substr($response, 0, $headerSize);
-        $rawBody = substr($response, $headerSize);
-        curl_close($ch);
+        $rawHeaders = $http_response_header ?? [];
+        $status = $this->extractStatus($rawHeaders);
 
         $data = json_decode($rawBody, true);
         if (json_last_error() !== JSON_ERROR_NONE) {
@@ -83,15 +71,26 @@ class ApiClient
             'headers' => $this->parseHeaders($rawHeaders),
             'raw' => $rawBody,
             'data' => $data,
-            'error' => null,
+            'error' => $error,
         ];
     }
 
-    private function parseHeaders(string $rawHeaders): array
+    private function extractStatus(array $rawHeaders): int
+    {
+        if (empty($rawHeaders)) {
+            return 0;
+        }
+        $first = $rawHeaders[0];
+        if (preg_match('#HTTP/\d+\.\d+\s+(\d+)#', $first, $matches)) {
+            return (int) $matches[1];
+        }
+        return 0;
+    }
+
+    private function parseHeaders(array $rawHeaders): array
     {
         $headers = [];
-        $lines = preg_split('/\r\n|\n|\r/', trim($rawHeaders));
-        foreach ($lines as $line) {
+        foreach ($rawHeaders as $line) {
             if (strpos($line, ':') === false) {
                 continue;
             }

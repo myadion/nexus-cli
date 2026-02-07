@@ -3,10 +3,10 @@
 
 declare(strict_types=1);
 
-use Symfony\Component\Console\Application;
-use Adion\NexusCli\Command\ApiCommand;
-use Adion\NexusCli\Command\AuthCommand;
-use Adion\NexusCli\Command\InitCommand;
+use Adion\NexusCli\Config\ConfigStore;
+use Adion\NexusCli\Http\ApiClient;
+
+const NEXUS_VERSION = '0.3.0';
 
 $autoloadCandidates = [
     __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php',
@@ -38,8 +38,603 @@ if (!$autoloadLoaded) {
     });
 }
 
-$cli = new Application('Nexus CLI', '0.2.2');
-$cli->add(new InitCommand());
-$cli->add(new AuthCommand());
-$cli->add(new ApiCommand());
-$cli->run();
+$argv = $_SERVER['argv'] ?? [];
+array_shift($argv);
+
+if (in_array('--version', $argv, true) || in_array('version', $argv, true)) {
+    echo 'nexus ' . NEXUS_VERSION . PHP_EOL;
+    exit(0);
+}
+
+if (empty($argv) || in_array('--help', $argv, true) || in_array('help', $argv, true)) {
+    printHelp();
+    exit(0);
+}
+
+$command = array_shift($argv);
+$action = null;
+if (in_array($command, ['auth', 'api'], true) && isset($argv[0]) && strpos($argv[0], '--') !== 0) {
+    $action = array_shift($argv);
+}
+
+[$opts, $args] = parseOptions($argv);
+
+switch ($command) {
+    case 'init':
+        exit(handleInit($opts));
+    case 'auth':
+        exit(handleAuth($action, $opts));
+    case 'api':
+        exit(handleApi($action, $opts));
+    default:
+        fwrite(STDERR, "Unknown command: $command" . PHP_EOL);
+        printHelp();
+        exit(1);
+}
+
+function handleInit(array $opts): int
+{
+    $remote = trim((string) ($opts['remote'] ?? ''));
+    if ($remote === '') {
+        fwrite(STDERR, "--remote is required" . PHP_EOL);
+        return 1;
+    }
+
+    $config = new ConfigStore();
+    $payload = [
+        'remote' => ConfigStore::normalizeRemote($remote),
+    ];
+
+    foreach (['ak', 'ck', 'sk'] as $key) {
+        if (isset($opts[$key]) && $opts[$key] !== '') {
+            $payload[$key] = $opts[$key];
+        }
+    }
+
+    $force = !empty($opts['force']);
+    if (file_exists($config->path()) && !$force) {
+        fwrite(STDERR, "Config already exists. Use --force to overwrite." . PHP_EOL);
+        return 1;
+    }
+
+    $config->merge($payload);
+    if (!$config->save()) {
+        fwrite(STDERR, "Failed to write config." . PHP_EOL);
+        return 1;
+    }
+
+    echo "Config written: " . $config->path() . PHP_EOL;
+    return 0;
+}
+
+function handleAuth(?string $action, array $opts): int
+{
+    if (!$action) {
+        fwrite(STDERR, "auth requires an action: login|verify|status|logout" . PHP_EOL);
+        return 1;
+    }
+
+    $config = new ConfigStore();
+    $remote = (string) ($opts['remote'] ?? $config->get('remote') ?? getenv('NEXUS_REMOTE'));
+    if ($remote === '') {
+        fwrite(STDERR, "Missing remote. Run: nexus init --remote=\"adion-api.eu\"" . PHP_EOL);
+        return 1;
+    }
+    $remote = ConfigStore::normalizeRemote($remote);
+
+    $ak = (string) ($opts['ak'] ?? $config->get('ak') ?? getenv('NEXUS_AK'));
+    $ck = (string) ($opts['ck'] ?? $config->get('ck') ?? getenv('NEXUS_CK'));
+    $sk = (string) ($opts['sk'] ?? $config->get('sk') ?? getenv('NEXUS_SK'));
+
+    if ($ak === '') {
+        fwrite(STDERR, "Missing ak. Set with: nexus init --ak=\"...\"" . PHP_EOL);
+        return 1;
+    }
+
+    $client = new ApiClient($remote, $ak, $ck, $sk);
+
+    switch ($action) {
+        case 'login':
+            return authLogin($client, $config, $opts);
+        case 'verify':
+            return authVerify($client, $config, $opts);
+        case 'status':
+            return authStatus($client);
+        case 'logout':
+            return authLogout($client, $config);
+        default:
+            fwrite(STDERR, "Unknown auth action: $action" . PHP_EOL);
+            return 1;
+    }
+}
+
+function authLogin(ApiClient $client, ConfigStore $config, array $opts): int
+{
+    $payload = authPayload($opts);
+    if ($payload === null) {
+        return 1;
+    }
+
+    $res = $client->request('POST', '/auth/login', $payload);
+    if ($res['status'] >= 400 || $res['status'] === 0) {
+        $message = $res['data']['message'] ?? $res['raw'] ?? $res['error'] ?? 'Login failed';
+        fwrite(STDERR, "Login failed: $message" . PHP_EOL);
+        return 1;
+    }
+
+    $data = $res['data'] ?? [];
+    if (!empty($data['key'])) {
+        $config->set('ck', $data['key']);
+    }
+    if (!empty($data['secret'])) {
+        $config->set('sk', $data['secret']);
+    }
+    $config->save();
+
+    echo "Login started. Check your device for verification code." . PHP_EOL;
+    if (!empty($data['message'])) {
+        echo $data['message'] . PHP_EOL;
+    }
+
+    return 0;
+}
+
+function authVerify(ApiClient $client, ConfigStore $config, array $opts): int
+{
+    $code = trim((string) ($opts['code'] ?? ''));
+    if ($code === '') {
+        fwrite(STDERR, "--code is required" . PHP_EOL);
+        return 1;
+    }
+
+    $ck = (string) ($opts['ck'] ?? $config->get('ck') ?? getenv('NEXUS_CK'));
+    if ($ck === '') {
+        fwrite(STDERR, "Missing consumer key (ck). Login first or set --ck." . PHP_EOL);
+        return 1;
+    }
+
+    $res = $client->request('POST', '/auth/verify', ['code' => $ck . '-' . $code]);
+    if ($res['status'] >= 400 || $res['status'] === 0) {
+        $message = $res['data']['message'] ?? $res['raw'] ?? $res['error'] ?? 'Verification failed';
+        fwrite(STDERR, "Verification failed: $message" . PHP_EOL);
+        return 1;
+    }
+
+    echo "Verification successful." . PHP_EOL;
+    return 0;
+}
+
+function authStatus(ApiClient $client): int
+{
+    $res = $client->request('GET', '/auth/login');
+    if ($res['status'] >= 400 || $res['status'] === 0) {
+        $message = $res['data']['message'] ?? $res['raw'] ?? $res['error'] ?? 'Status failed';
+        fwrite(STDERR, "Status failed: $message" . PHP_EOL);
+        return 1;
+    }
+
+    echo 'Auth status: ' . ($res['raw'] ?: 'ok') . PHP_EOL;
+    return 0;
+}
+
+function authLogout(ApiClient $client, ConfigStore $config): int
+{
+    $res = $client->request('DELETE', '/auth/login');
+    if ($res['status'] >= 400 || $res['status'] === 0) {
+        $message = $res['data']['message'] ?? $res['raw'] ?? $res['error'] ?? 'Logout failed';
+        fwrite(STDERR, "Logout failed: $message" . PHP_EOL);
+        return 1;
+    }
+
+    $config->set('ck', '');
+    $config->set('sk', '');
+    $config->save();
+
+    echo "Logged out." . PHP_EOL;
+    return 0;
+}
+
+function authPayload(array $opts): ?array
+{
+    if (!empty($opts['payload'])) {
+        $data = json_decode((string) $opts['payload'], true);
+        if (!is_array($data)) {
+            fwrite(STDERR, "Invalid JSON payload." . PHP_EOL);
+            return null;
+        }
+        return $data;
+    }
+
+    $realm = trim((string) ($opts['realm'] ?? ''));
+    $email = trim((string) ($opts['email'] ?? ''));
+    $password = trim((string) ($opts['password'] ?? ''));
+    $username = trim((string) ($opts['username'] ?? ''));
+    $expiration = trim((string) ($opts['expiration'] ?? ''));
+
+    if ($realm !== '' || $email !== '') {
+        if ($email === '' || $password === '') {
+            fwrite(STDERR, "Telecom login requires --email and --password." . PHP_EOL);
+            return null;
+        }
+        $payload = [
+            'realm' => $realm,
+            'email' => $email,
+            'password' => $password,
+        ];
+        if ($expiration !== '') {
+            $payload['expiration'] = $expiration;
+        }
+        return $payload;
+    }
+
+    if ($username === '') {
+        fwrite(STDERR, "--username is required" . PHP_EOL);
+        return null;
+    }
+
+    if ($password !== '') {
+        return [
+            'username' => $username,
+            'password' => $password,
+        ];
+    }
+
+    return [
+        'username' => $username,
+    ];
+}
+
+function handleApi(?string $action, array $opts): int
+{
+    if ($action !== 'add') {
+        fwrite(STDERR, "api requires action: add" . PHP_EOL);
+        return 1;
+    }
+
+    $method = strtolower(trim((string) ($opts['method'] ?? '')));
+    $uri = trim((string) ($opts['uri'] ?? ''));
+
+    if ($method === '' || $uri === '') {
+        fwrite(STDERR, "Both --method and --uri are required." . PHP_EOL);
+        return 1;
+    }
+
+    $allowedMethods = ['get', 'post', 'put', 'delete'];
+    if (!in_array($method, $allowedMethods, true)) {
+        fwrite(STDERR, "Invalid method. Allowed: get, post, put, delete." . PHP_EOL);
+        return 1;
+    }
+
+    $config = new ConfigStore();
+    $remote = (string) ($opts['remote'] ?? $config->get('remote') ?? getenv('NEXUS_REMOTE'));
+    if ($remote === '') {
+        fwrite(STDERR, "Missing remote. Run: nexus init --remote=\"adion-api.eu\"" . PHP_EOL);
+        return 1;
+    }
+    $remote = ConfigStore::normalizeRemote($remote);
+
+    $ak = (string) ($opts['ak'] ?? $config->get('ak') ?? getenv('NEXUS_AK'));
+    $ck = (string) ($opts['ck'] ?? $config->get('ck') ?? getenv('NEXUS_CK'));
+    $sk = (string) ($opts['sk'] ?? $config->get('sk') ?? getenv('NEXUS_SK'));
+
+    if ($ak === '') {
+        fwrite(STDERR, "Missing ak. Set with: nexus init --ak=\"...\"" . PHP_EOL);
+        return 1;
+    }
+
+    $client = new ApiClient($remote, $ak, $ck, $sk);
+
+    $route = normalizeRoute($uri);
+    $group = (string) ($opts['group'] ?? '');
+    if ($group === '') {
+        $group = inferGroup($route);
+    }
+
+    $description = (string) ($opts['description'] ?? '');
+    if ($description === '') {
+        $description = strtoupper($method) . ' ' . $route;
+    }
+
+    $payload = [
+        'group' => $group,
+        'route' => $route,
+        'method' => $method,
+        'description' => $description,
+        'is_beta' => !empty($opts['beta']),
+        'is_public' => !empty($opts['public']),
+        'is_deprecated' => !empty($opts['deprecated']),
+        'is_active' => empty($opts['inactive']),
+    ];
+
+    $dryRun = !empty($opts['dry-run']);
+
+    $existing = findExistingApi($client, $route, $method);
+    if ($existing && empty($opts['update'])) {
+        fwrite(STDERR, "API already exists. Use --update to modify it." . PHP_EOL);
+        return 1;
+    }
+
+    if ($dryRun) {
+        echo 'Dry-run: API would be ' . ($existing ? 'updated' : 'created') . '.' . PHP_EOL;
+        return 0;
+    }
+
+    $result = null;
+    if ($existing) {
+        $result = requestOrFail($client, 'PUT', '/admin/api/' . $existing['id'], $payload);
+    } else {
+        $result = requestOrFail($client, 'POST', '/admin/api', $payload);
+    }
+
+    if (!$result || empty($result['id'])) {
+        fwrite(STDERR, "API creation/update failed." . PHP_EOL);
+        return 1;
+    }
+
+    $apiId = $result['id'];
+    echo 'API ' . ($existing ? 'updated' : 'created') . '.' . PHP_EOL;
+
+    if (empty($opts['no-permission'])) {
+        $function = (string) ($opts['permission-function'] ?? '*');
+        $permDesc = (string) ($opts['permission-desc'] ?? '');
+        createPermission($client, $apiId, $description, $function, $permDesc);
+    }
+
+    $params = toArray($opts['param'] ?? []);
+    createParameters($client, $apiId, $params);
+
+    $responses = toArray($opts['response'] ?? []);
+    createResponses($client, $apiId, $responses);
+
+    return 0;
+}
+
+function requestOrFail(ApiClient $client, string $method, string $path, $body = null): ?array
+{
+    $res = $client->request($method, $path, $body);
+    if ($res['status'] === 0 || $res['status'] >= 400) {
+        $message = $res['data']['message'] ?? $res['raw'] ?? $res['error'] ?? 'Request failed';
+        fwrite(STDERR, "HTTP {$res['status']}: $message" . PHP_EOL);
+        return null;
+    }
+    return $res['data'] ?? [];
+}
+
+function findExistingApi(ApiClient $client, string $route, string $method): ?array
+{
+    $list = requestOrFail($client, 'GET', '/admin/api');
+    if (!is_array($list)) {
+        return null;
+    }
+
+    foreach ($list as $api) {
+        if (!is_array($api)) {
+            continue;
+        }
+        if (($api['route'] ?? null) === $route && strtolower((string) ($api['method'] ?? '')) === $method) {
+            return $api;
+        }
+    }
+
+    return null;
+}
+
+function createPermission(ApiClient $client, string $apiId, string $apiDescription, string $function, string $description): void
+{
+    $payload = [
+        'function' => $function !== '' ? $function : '*',
+        'description' => $description !== '' ? $description : $apiDescription,
+    ];
+
+    $result = requestOrFail($client, 'POST', '/admin/api/' . $apiId . '/permission', $payload);
+    if ($result) {
+        echo "Permission created." . PHP_EOL;
+    }
+}
+
+function createParameters(ApiClient $client, string $apiId, array $params): void
+{
+    foreach ($params as $raw) {
+        $parts = explode(':', $raw, 5);
+        if (count($parts) < 4) {
+            fwrite(STDERR, "Invalid param format, expected name:in:type:required:description" . PHP_EOL);
+            continue;
+        }
+
+        $name = trim($parts[0]);
+        $in = trim($parts[1]);
+        $type = trim($parts[2]);
+        $requiredRaw = trim($parts[3]);
+        $desc = isset($parts[4]) ? trim($parts[4]) : '';
+
+        if ($name === '' || $in === '' || $type === '') {
+            fwrite(STDERR, "Invalid param format, missing name/in/type" . PHP_EOL);
+            continue;
+        }
+
+        $required = filter_var($requiredRaw, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        if ($required === null) {
+            $required = $requiredRaw === '1';
+        }
+
+        $payload = [
+            'name' => $name,
+            'description' => $desc,
+            'in' => $in,
+            'type' => $type,
+            'required' => (bool) $required,
+        ];
+
+        $result = requestOrFail($client, 'POST', '/admin/api/' . $apiId . '/parameter', $payload);
+        if ($result) {
+            echo 'Parameter created: ' . $name . PHP_EOL;
+        }
+    }
+}
+
+function createResponses(ApiClient $client, string $apiId, array $responses): void
+{
+    foreach ($responses as $raw) {
+        $parts = explode(':', $raw, 3);
+        if (count($parts) < 3) {
+            fwrite(STDERR, "Invalid response format, expected code:description:json" . PHP_EOL);
+            continue;
+        }
+
+        $code = (int) trim($parts[0]);
+        $desc = trim($parts[1]);
+        $content = trim($parts[2]);
+
+        if ($content !== '' && $content[0] === '@') {
+            $file = substr($content, 1);
+            if (!is_file($file)) {
+                fwrite(STDERR, "Response file not found: $file" . PHP_EOL);
+                continue;
+            }
+            $content = (string) file_get_contents($file);
+        }
+
+        if (!isValidJson($content)) {
+            fwrite(STDERR, "Invalid JSON for response code $code" . PHP_EOL);
+            continue;
+        }
+
+        $payload = [
+            'code' => $code,
+            'description' => $desc,
+            'content' => $content,
+        ];
+
+        $result = requestOrFail($client, 'POST', '/admin/api/' . $apiId . '/response', $payload);
+        if ($result) {
+            echo 'Response created: ' . $code . PHP_EOL;
+        }
+    }
+}
+
+function isValidJson(string $json): bool
+{
+    if ($json === '') {
+        return false;
+    }
+    json_decode($json, true);
+    return json_last_error() === JSON_ERROR_NONE;
+}
+
+function normalizeRoute(string $uri): string
+{
+    $route = trim($uri);
+    if (strpos($route, 'http') === 0) {
+        $parsed = parse_url($route);
+        if (!empty($parsed['path'])) {
+            $route = $parsed['path'];
+        }
+    }
+
+    if (strpos($route, '/api/') === 0) {
+        $route = substr($route, 4);
+    } elseif (strpos($route, 'api/') === 0) {
+        $route = substr($route, 3);
+    }
+
+    if ($route === '') {
+        return '/';
+    }
+
+    if ($route[0] !== '/') {
+        $route = '/' . $route;
+    }
+
+    if (strlen($route) > 1) {
+        $route = rtrim($route, '/');
+    }
+
+    return $route;
+}
+
+function inferGroup(string $route): string
+{
+    $trimmed = ltrim($route, '/');
+    if ($trimmed === '') {
+        return 'default';
+    }
+
+    $parts = explode('/', $trimmed);
+    return $parts[0] ?: 'default';
+}
+
+function parseOptions(array $argv): array
+{
+    $opts = [];
+    $args = [];
+
+    for ($i = 0; $i < count($argv); $i++) {
+        $arg = $argv[$i];
+        if (strpos($arg, '--') === 0) {
+            $keyValue = substr($arg, 2);
+            $key = $keyValue;
+            $value = true;
+
+            if (strpos($keyValue, '=') !== false) {
+                [$key, $value] = explode('=', $keyValue, 2);
+            } elseif (isset($argv[$i + 1]) && strpos($argv[$i + 1], '--') !== 0) {
+                $value = $argv[$i + 1];
+                $i++;
+            }
+
+            $opts[$key] = mergeOptionValue($opts[$key] ?? null, $value);
+        } else {
+            $args[] = $arg;
+        }
+    }
+
+    return [$opts, $args];
+}
+
+function mergeOptionValue($current, $value)
+{
+    if ($current === null) {
+        return $value;
+    }
+    if (!is_array($current)) {
+        return [$current, $value];
+    }
+    $current[] = $value;
+    return $current;
+}
+
+function toArray($value): array
+{
+    if ($value === null || $value === []) {
+        return [];
+    }
+    return is_array($value) ? $value : [$value];
+}
+
+function printHelp(): void
+{
+    $text = <<<TXT
+nexus CLI (no external dependencies)
+
+Usage:
+  nexus --version
+  nexus init --remote="adion-api.eu" [--ak=KEY --ck=KEY --sk=KEY] [--force]
+  nexus auth login --username="user" [--password="pass"]
+  nexus auth login --realm="realm" --email="x@y.z" --password="pass" [--expiration=3600]
+  nexus auth verify --code=12345
+  nexus auth status
+  nexus auth logout
+  nexus api add --method=get --uri=/me/history [--group=me] [--description="..."]
+           [--public --beta --deprecated --inactive]
+           [--param name:in:type:required:description]
+           [--response code:description:{"json":"here"}]
+
+Examples:
+  nexus init --remote="adion-api.eu" --ak="YOUR_APP_KEY"
+  nexus auth login --username="user@email.com"
+  nexus auth verify --code="12345"
+  nexus api add --method=get --uri=/me/history --description="User history"
+TXT;
+
+    echo $text . PHP_EOL;
+}
