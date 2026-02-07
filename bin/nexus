@@ -6,7 +6,7 @@ declare(strict_types=1);
 use Adion\NexusCli\Config\ConfigStore;
 use Adion\NexusCli\Http\ApiClient;
 
-const NEXUS_VERSION = '0.3.0';
+const NEXUS_VERSION = '0.3.1';
 
 $autoloadCandidates = [
     __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php',
